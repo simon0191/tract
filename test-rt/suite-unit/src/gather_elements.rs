@@ -2,7 +2,8 @@ use infra::{Test, TestResult, TestSuite};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use tract_core::internal::*;
-use tract_core::ndarray::{ArrayD, Dimension};
+use tract_core::ndarray::ArrayD;
+use tract_core::ndarray::Dimension;
 use tract_core::ops::array::GatherElements;
 
 /// `data` is filled with its own flat offsets, so the expected value at a given
@@ -23,20 +24,18 @@ impl GatherElementsProblem {
     }
 
     fn reference(&self) -> ArrayD<f32> {
-        let mut strides = vec![1usize; self.data_shape.len()];
-        for axis in (1..self.data_shape.len()).rev() {
-            strides[axis - 1] = strides[axis] * self.data_shape[axis];
-        }
+        let strides = natural_strides(&self.data_shape);
         ArrayD::from_shape_fn(self.indices.shape(), |coords| {
             let index = self.indices[&coords];
             let resolved =
                 if index < 0 { index + self.data_shape[self.axis] as i64 } else { index } as usize;
-            let offset: usize = coords
+            let offset: isize = coords
                 .slice()
                 .iter()
                 .enumerate()
-                .map(|(axis, &coord)| {
-                    strides[axis] * if axis == self.axis { resolved } else { coord }
+                .map(|(coord_axis, &coord)| {
+                    strides[coord_axis]
+                        * if coord_axis == self.axis { resolved } else { coord } as isize
                 })
                 .sum();
             offset as f32
@@ -59,7 +58,7 @@ impl Arbitrary for GatherElementsProblem {
     type Strategy = BoxedStrategy<GatherElementsProblem>;
 
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        vec(1usize..6, 1usize..4)
+        vec(1usize..6, 1usize..5)
             .prop_flat_map(|data_shape| {
                 let rank = data_shape.len();
                 (Just(data_shape), 0..rank)
@@ -67,14 +66,18 @@ impl Arbitrary for GatherElementsProblem {
             .prop_flat_map(|(data_shape, axis)| {
                 // Off `axis`, indices are allowed to be smaller than data, which
                 // is what takes the op off the contiguous last-axis fast path.
+                // `Just(dim)` is drawn explicitly so equal leading dimensions
+                // stay common as rank grows instead of being a coincidence.
                 let indices_shape = data_shape
                     .iter()
                     .enumerate()
-                    .map(
-                        |(ax, &dim)| {
-                            if ax == axis { (1usize..6).boxed() } else { (1..=dim).boxed() }
-                        },
-                    )
+                    .map(|(ax, &dim)| {
+                        if ax == axis {
+                            (1usize..6).boxed()
+                        } else {
+                            prop_oneof![Just(dim), 1..=dim].boxed()
+                        }
+                    })
                     .collect::<Vec<_>>();
                 (Just(data_shape), Just(axis), indices_shape)
             })
@@ -138,7 +141,10 @@ pub fn suite() -> TractResult<TestSuite> {
     );
     suite.add("last_axis_rank_1", problem(&[8], 0, &[5], |ix| (ix * 3 % 8) as i64));
     suite.add("first_axis", problem(&[4, 8], 0, &[3, 8], |ix| (ix % 4) as i64));
-    suite.add("mismatched_leading_dims", problem(&[2, 3, 8], 2, &[1, 3, 5], |ix| (ix % 8) as i64));
+    // A reduced OUTERMOST dim leaves the flat row offset accidentally correct, so
+    // it does not on its own prove the fast path checks the leading dims.
+    suite.add("mismatched_inner_dim", problem(&[2, 3, 8], 2, &[2, 2, 5], |ix| (ix % 8) as i64));
+    suite.add("mismatched_outer_dim", problem(&[2, 3, 8], 2, &[1, 3, 5], |ix| (ix % 8) as i64));
     suite.add("empty_rows", problem(&[2, 0, 8], 2, &[2, 0, 5], |_| 0));
     suite.add("empty_last_axis", problem(&[2, 3, 8], 2, &[2, 3, 0], |_| 0));
 
